@@ -4,13 +4,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import uuid
 import json
 import asyncio
 
 from . import storage
-from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
+from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings, resolve_web_search, stage0_search, stage0_5_gap_fill, get_search_context
+from .search import public_search
 
 app = FastAPI(title="LLM Council API")
 
@@ -32,6 +33,7 @@ class CreateConversationRequest(BaseModel):
 class SendMessageRequest(BaseModel):
     """Request to send a message in a conversation."""
     content: str
+    web_search: Optional[bool] = None  # None = WEB_SEARCH_DEFAULT
 
 
 class ConversationMetadata(BaseModel):
@@ -103,7 +105,8 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
 
     # Run the 3-stage council process
     stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
-        request.content
+        request.content,
+        request.web_search
     )
 
     # Add assistant message with all stages
@@ -111,7 +114,8 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         conversation_id,
         stage1_results,
         stage2_results,
-        stage3_result
+        stage3_result,
+        metadata.get("search")
     )
 
     # Return the complete response with metadata
@@ -147,20 +151,38 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             if is_first_message:
                 title_task = asyncio.create_task(generate_conversation_title(request.content))
 
+            # Stage 0: Shared web search (no search events when search is off)
+            search = None
+            if resolve_web_search(request.web_search):
+                yield f"data: {json.dumps({'type': 'search_start'})}\n\n"
+                search = await stage0_search(request.content, True)
+                public = public_search(search)
+                search_data = {'status': public['status'], 'queries': public['queries'], 'sources': public['sources']}
+                yield f"data: {json.dumps({'type': 'search_complete', 'data': search_data})}\n\n"
+
+                # Stage 0.5: Gap-fill, only when Stage 0 found sources
+                if search['status'] == 'ok':
+                    yield f"data: {json.dumps({'type': 'gap_start'})}\n\n"
+                    search, added = await stage0_5_gap_fill(request.content, search)
+                    gap_sources = public_search({'status': 'ok', 'sources': added['sources']})['sources']
+                    gap_data = {'queries': added['queries'], 'sources': gap_sources}
+                    yield f"data: {json.dumps({'type': 'gap_complete', 'data': gap_data})}\n\n"
+            context = get_search_context(search)
+
             # Stage 1: Collect responses
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(request.content)
+            stage1_results = await stage1_collect_responses(request.content, context)
             yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
 
             # Stage 2: Collect rankings
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
+            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results, context)
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
             yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
 
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results, context)
             yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
 
             # Wait for title generation if it was started
@@ -174,7 +196,8 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 conversation_id,
                 stage1_results,
                 stage2_results,
-                stage3_result
+                stage3_result,
+                public_search(search)
             )
 
             # Send completion event

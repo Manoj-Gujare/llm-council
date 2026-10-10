@@ -57,6 +57,47 @@ COUNCIL_MODELS = [
 CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
 ```
 
+## Web Search
+
+The council can ground its answers in shared web search results from [Tavily](https://tavily.com/).
+
+**Setup:** add a Tavily key to `.env`:
+
+```bash
+TAVILY_API_KEY=tvly-...
+```
+
+Without a key the council runs exactly as before. Use the "Web search" checkbox next to Send to turn search on or off for a question.
+
+**Fairness design:** every council member competes on identical evidence.
+
+1. **Stage 0 (shared search):** a planner model proposes up to 3 queries while the raw question is searched in parallel. Sources are picked round-robin across queries, deduped by URL, and numbered [1]..[N]. If the planner says no search is needed (coding, math, creative writing), search is skipped.
+2. **Stage 0.5 (gap-fill):** each council model may request up to 2 extra queries. Requests are merged (duplicates and near-duplicates dropped, picked round-robin across models) and the results are appended to the same shared pool. Source numbers never change once assigned.
+3. **Stages 1-3:** every prompt contains the byte-identical evidence block. Models cite sources as [n], judges fact-check answers against the sources, and the chairman keeps the citations. Prompts never reveal which model requested which query; that attribution is shown only in the UI.
+
+Models never search on their own. If search is off or finds nothing, the prompts are exactly the original ones.
+
+**Config knobs** (`backend/config.py`):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `WEB_SEARCH_DEFAULT` | `true` (env) | Search when the request doesn't say |
+| `SEARCH_PLANNER_MODEL` | `google/gemini-2.5-flash` | Model that plans Stage 0 queries |
+| `SEARCH_MAX_QUERIES` | 3 | Planner query limit |
+| `SEARCH_RESULTS_PER_QUERY` | 5 | Tavily results per query |
+| `SEARCH_MAX_SOURCES` | 8 | Stage 0 pool size |
+| `SEARCH_DEPTH` | `basic` | Tavily search depth (`basic` or `advanced`) |
+| `SEARCH_SNIPPET_CHARS` | 1000 | Snippet length per source in prompts |
+| `GAP_FILL_ENABLED` | `true` (env) | Run Stage 0.5 |
+| `GAP_MAX_QUERIES_PER_MODEL` | 2 | Gap queries each model may request |
+| `GAP_MAX_TOTAL_QUERIES` | 6 | Gap queries run in total |
+| `GAP_SOURCES_PER_QUERY` | 2 | New sources added per gap query |
+| `SEARCH_MAX_SOURCES_TOTAL` | 12 | Hard cap on the final pool |
+
+**Don't use OpenRouter's `:online` suffix for council models.** It makes each model search on its own, so they would answer from different evidence and the peer review would no longer be fair.
+
+Run the tests with `uv run pytest`.
+
 ## Running the Application
 
 **Option 1: Use the start script**

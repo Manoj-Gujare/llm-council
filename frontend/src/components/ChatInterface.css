@@ -161,3 +161,26 @@
   background: #ccc;
   border-color: #ccc;
 }
+
+.input-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.web-search-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #555;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.web-search-toggle input {
+  accent-color: #4a90e2;
+  cursor: pointer;
+}

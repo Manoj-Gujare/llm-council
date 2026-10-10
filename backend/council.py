@@ -1,21 +1,222 @@
 """3-stage LLM Council orchestration."""
 
-from typing import List, Dict, Any, Tuple
+import asyncio
+from typing import List, Dict, Any, Tuple, Optional
 from .openrouter import query_models_parallel, query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+from .config import (
+    COUNCIL_MODELS,
+    CHAIRMAN_MODEL,
+    WEB_SEARCH_DEFAULT,
+    GAP_FILL_ENABLED,
+    GAP_MAX_QUERIES_PER_MODEL,
+    GAP_MAX_TOTAL_QUERIES,
+    GAP_SOURCES_PER_QUERY,
+    SEARCH_MAX_SOURCES_TOTAL,
+)
+from .search import (
+    run_stage0_search,
+    tavily_search,
+    evidence_block,
+    build_context,
+    make_source,
+    normalize_query,
+    normalize_url,
+    extract_json,
+    public_search,
+)
+
+STAGE1_SEARCH_INSTRUCTIONS = """Answer the question below using the web search results above together with your own knowledge.
+- Cite the sources you rely on as [n], using the source numbers above.
+- If sources conflict with each other or look outdated, say so.
+- Mark claims that come from your own knowledge rather than the sources (for example "(own knowledge)").
+- Never invent sources, source numbers, or URLs."""
 
 
-async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
+def resolve_web_search(web_search: Optional[bool]) -> bool:
+    """None means use the configured default."""
+    if web_search is None:
+        return WEB_SEARCH_DEFAULT
+    return web_search
+
+
+async def stage0_search(user_query: str, web_search: Optional[bool] = None) -> Optional[Dict[str, Any]]:
+    """
+    Stage 0: shared web search. Returns None when web search is off.
+    """
+    if not resolve_web_search(web_search):
+        return None
+    return await run_stage0_search(user_query)
+
+
+def get_search_context(search: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Context string for prompts, or None unless search status is ok."""
+    if search is None or search.get("status") != "ok" or not search.get("context"):
+        return None
+    return search["context"]
+
+
+def query_tokens(query: str) -> set:
+    return set(normalize_query(query).split())
+
+
+def jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 1.0
+    return len(a & b) / len(a | b)
+
+
+def merge_gap_queries(
+    requests: Dict[str, List[str]],
+    used_queries: List[str],
+) -> List[Dict[str, Any]]:
+    """
+    Merge gap-fill query requests from all models.
+
+    Picks round-robin across models (first request of each model, then second, ...)
+    so no single model dominates. Drops exact and near-duplicates (token Jaccard >= 0.7),
+    including queries already used in Stage 0. A duplicate request from another model
+    is credited in requested_by of the query it duplicates.
+
+    Returns:
+        List of {"query", "requested_by"} dicts, at most GAP_MAX_TOTAL_QUERIES.
+    """
+    used_tokens = [query_tokens(q) for q in used_queries]
+    used_norm = {normalize_query(q) for q in used_queries}
+    merged = []
+
+    per_model = {
+        model: queries[:GAP_MAX_QUERIES_PER_MODEL]
+        for model, queries in requests.items()
+    }
+    depth = max((len(q) for q in per_model.values()), default=0)
+
+    for i in range(depth):
+        for model, queries in per_model.items():
+            if i >= len(queries):
+                continue
+            norm = normalize_query(queries[i])
+            if not norm or norm in used_norm:
+                continue
+            tokens = query_tokens(norm)
+            if any(jaccard(tokens, t) >= 0.7 for t in used_tokens):
+                continue
+
+            duplicate_of = None
+            for entry in merged:
+                if norm == entry["normalized"] or jaccard(tokens, entry["tokens"]) >= 0.7:
+                    duplicate_of = entry
+                    break
+            if duplicate_of is not None:
+                if model not in duplicate_of["requested_by"]:
+                    duplicate_of["requested_by"].append(model)
+                continue
+
+            if len(merged) >= GAP_MAX_TOTAL_QUERIES:
+                continue
+            merged.append({
+                "query": " ".join(queries[i].split()),
+                "requested_by": [model],
+                "normalized": norm,
+                "tokens": tokens,
+            })
+
+    return [{"query": m["query"], "requested_by": m["requested_by"]} for m in merged]
+
+
+def parse_gap_queries(text: str) -> List[str]:
+    """Parse {"queries": [...]} from model output; anything malformed means []."""
+    parsed = extract_json(text or "", "{", "}")
+    if not isinstance(parsed, dict):
+        return []
+    queries = parsed.get("queries")
+    if not isinstance(queries, list):
+        return []
+    return [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+
+
+async def stage0_5_gap_fill(
+    user_query: str,
+    search: Optional[Dict[str, Any]]
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Stage 0.5: every council model may request extra searches. Results go to the
+    shared pool that every model sees. Prompts never reveal who asked for what;
+    attribution is kept in metadata only.
+
+    Returns:
+        Tuple of (updated search dict, {"queries": [...], "sources": [...]} added)
+    """
+    added = {"queries": [], "sources": []}
+    if not GAP_FILL_ENABLED or search is None or search.get("status") != "ok":
+        return search, added
+    if len(search["sources"]) >= SEARCH_MAX_SOURCES_TOTAL:
+        return search, added
+
+    gap_prompt = f"""{evidence_block(search['context'])}
+
+Question: {user_query}
+
+List up to {GAP_MAX_QUERIES_PER_MODEL} search queries for information missing from these sources that is needed to answer well. Return ONLY JSON: {{"queries": [...]}}. Return {{"queries": []}} if the sources are sufficient."""
+
+    messages = [{"role": "user", "content": gap_prompt}]
+    responses = await query_models_parallel(COUNCIL_MODELS, messages, timeout=45.0)
+
+    requests = {}
+    for model, response in responses.items():
+        if response is None:
+            continue
+        requests[model] = parse_gap_queries(response.get("content") or "")
+
+    gap_queries = merge_gap_queries(requests, search["queries"])
+    if not gap_queries:
+        return search, added
+
+    result_lists = await asyncio.gather(*[tavily_search(q["query"]) for q in gap_queries])
+
+    sources = list(search["sources"])
+    seen = {normalize_url(s["url"]) for s in sources}
+    for gap_query, results in zip(gap_queries, result_lists):
+        taken = 0
+        for result in sorted(results, key=lambda r: r.get("score") or 0, reverse=True):
+            if taken >= GAP_SOURCES_PER_QUERY or len(sources) >= SEARCH_MAX_SOURCES_TOTAL:
+                break
+            key = normalize_url(result["url"])
+            if key in seen:
+                continue
+            seen.add(key)
+            source = make_source(len(sources) + 1, result, gap_query["query"])
+            source["gap"] = True
+            sources.append(source)
+            added["sources"].append(source)
+            taken += 1
+
+    added["queries"] = gap_queries
+    updated = dict(search)
+    updated["sources"] = sources
+    updated["gap_queries"] = gap_queries
+    updated["context"] = build_context(sources)
+    return updated, added
+
+
+async def stage1_collect_responses(
+    user_query: str,
+    search_context: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
 
     Args:
         user_query: The user's question
+        search_context: Shared web search context (None = no search)
 
     Returns:
         List of dicts with 'model' and 'response' keys
     """
-    messages = [{"role": "user", "content": user_query}]
+    if search_context:
+        prompt = f"{evidence_block(search_context)}\n\n{STAGE1_SEARCH_INSTRUCTIONS}\n\nQuestion: {user_query}"
+    else:
+        prompt = user_query
+    messages = [{"role": "user", "content": prompt}]
 
     # Query all models in parallel
     responses = await query_models_parallel(COUNCIL_MODELS, messages)
@@ -34,7 +235,8 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
 
 async def stage2_collect_rankings(
     user_query: str,
-    stage1_results: List[Dict[str, Any]]
+    stage1_results: List[Dict[str, Any]],
+    search_context: Optional[str] = None
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """
     Stage 2: Each model ranks the anonymized responses.
@@ -42,6 +244,7 @@ async def stage2_collect_rankings(
     Args:
         user_query: The original user query
         stage1_results: Results from Stage 1
+        search_context: Shared web search context (None = no search)
 
     Returns:
         Tuple of (rankings list, label_to_model mapping)
@@ -61,7 +264,18 @@ async def stage2_collect_rankings(
         for label, result in zip(labels, stage1_results)
     ])
 
-    ranking_prompt = f"""You are evaluating different responses to the following question:
+    # Empty strings keep the prompt byte-identical to the no-search version
+    evidence_prefix = ""
+    fact_check_instructions = ""
+    if search_context:
+        evidence_prefix = f"{evidence_block(search_context)}\n\n"
+        fact_check_instructions = (
+            " Fact-check each response's claims against the web search results above:"
+            " reward answers that are correct and well cited, penalize claims that contradict"
+            " the sources, and penalize citations [n] that do not support the claim they are attached to."
+        )
+
+    ranking_prompt = f"""{evidence_prefix}You are evaluating different responses to the following question:
 
 Question: {user_query}
 
@@ -70,7 +284,7 @@ Here are the responses from different models (anonymized):
 {responses_text}
 
 Your task:
-1. First, evaluate each response individually. For each response, explain what it does well and what it does poorly.
+1. First, evaluate each response individually. For each response, explain what it does well and what it does poorly.{fact_check_instructions}
 2. Then, at the very end of your response, provide a final ranking.
 
 IMPORTANT: Your final ranking MUST be formatted EXACTLY as follows:
@@ -115,7 +329,8 @@ Now provide your evaluation and ranking:"""
 async def stage3_synthesize_final(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
-    stage2_results: List[Dict[str, Any]]
+    stage2_results: List[Dict[str, Any]],
+    search_context: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Stage 3: Chairman synthesizes final response.
@@ -124,6 +339,7 @@ async def stage3_synthesize_final(
         user_query: The original user query
         stage1_results: Individual model responses from Stage 1
         stage2_results: Rankings from Stage 2
+        search_context: Shared web search context (None = no search)
 
     Returns:
         Dict with 'model' and 'response' keys
@@ -139,7 +355,17 @@ async def stage3_synthesize_final(
         for result in stage2_results
     ])
 
-    chairman_prompt = f"""You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
+    # Empty strings keep the prompt byte-identical to the no-search version
+    evidence_prefix = ""
+    source_instructions = ""
+    if search_context:
+        evidence_prefix = f"{evidence_block(search_context)}\n\n"
+        source_instructions = (
+            "\n- Prefer claims supported by the web search results; correct claims the sources contradict"
+            "\n- Keep the [n] source citations in your final answer, and never invent new sources or URLs"
+        )
+
+    chairman_prompt = f"""{evidence_prefix}You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
 
 Original Question: {user_query}
 
@@ -152,7 +378,7 @@ STAGE 2 - Peer Rankings:
 Your task as Chairman is to synthesize all of this information into a single, comprehensive, accurate answer to the user's original question. Consider:
 - The individual responses and their insights
 - The peer rankings and what they reveal about response quality
-- Any patterns of agreement or disagreement
+- Any patterns of agreement or disagreement{source_instructions}
 
 Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
 
@@ -293,28 +519,37 @@ Title:"""
     return title
 
 
-async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
+async def run_full_council(
+    user_query: str,
+    web_search: Optional[bool] = None
+) -> Tuple[List, List, Dict, Dict]:
     """
-    Run the complete 3-stage council process.
+    Run the complete council process (search, gap-fill, then 3 stages).
 
     Args:
         user_query: The user's question
+        web_search: Enable shared web search (None = WEB_SEARCH_DEFAULT)
 
     Returns:
         Tuple of (stage1_results, stage2_results, stage3_result, metadata)
     """
+    # Stage 0 + 0.5: shared web search and gap-fill
+    search = await stage0_search(user_query, web_search)
+    search, _ = await stage0_5_gap_fill(user_query, search)
+    context = get_search_context(search)
+
     # Stage 1: Collect individual responses
-    stage1_results = await stage1_collect_responses(user_query)
+    stage1_results = await stage1_collect_responses(user_query, context)
 
     # If no models responded successfully, return error
     if not stage1_results:
         return [], [], {
             "model": "error",
             "response": "All models failed to respond. Please try again."
-        }, {}
+        }, {"search": public_search(search)}
 
     # Stage 2: Collect rankings
-    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results)
+    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results, context)
 
     # Calculate aggregate rankings
     aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
@@ -323,13 +558,15 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     stage3_result = await stage3_synthesize_final(
         user_query,
         stage1_results,
-        stage2_results
+        stage2_results,
+        context
     )
 
     # Prepare metadata
     metadata = {
         "label_to_model": label_to_model,
-        "aggregate_rankings": aggregate_rankings
+        "aggregate_rankings": aggregate_rankings,
+        "search": public_search(search)
     }
 
     return stage1_results, stage2_results, stage3_result, metadata

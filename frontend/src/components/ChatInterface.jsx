@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import Stage1 from './Stage1';
 import Stage2 from './Stage2';
 import Stage3 from './Stage3';
+import Sources from './Sources';
 import './ChatInterface.css';
 
 export default function ChatInterface({
@@ -11,6 +12,7 @@ export default function ChatInterface({
   isLoading,
 }) {
   const [input, setInput] = useState('');
+  const [webSearch, setWebSearch] = useState(true);
   const messagesEndRef = useRef(null);
 
   const scrollToBottom = () => {
@@ -24,7 +26,7 @@ export default function ChatInterface({
   const handleSubmit = (e) => {
     e.preventDefault();
     if (input.trim() && !isLoading) {
-      onSendMessage(input);
+      onSendMessage(input, webSearch);
       setInput('');
     }
   };
@@ -71,6 +73,21 @@ export default function ChatInterface({
               ) : (
                 <div className="assistant-message">
                   <div className="message-label">LLM Council</div>
+
+                  {/* Stage 0 / 0.5: Shared web search */}
+                  {msg.loading?.search && (
+                    <div className="stage-loading">
+                      <div className="spinner"></div>
+                      <span>Searching the web...</span>
+                    </div>
+                  )}
+                  {msg.loading?.gap && (
+                    <div className="stage-loading">
+                      <div className="spinner"></div>
+                      <span>Council is checking for missing information...</span>
+                    </div>
+                  )}
+                  {msg.search && <Sources search={msg.search} />}
 
                   {/* Stage 1 */}
                   {msg.loading?.stage1 && (
@@ -131,13 +148,24 @@ export default function ChatInterface({
             disabled={isLoading}
             rows={3}
           />
-          <button
-            type="submit"
-            className="send-button"
-            disabled={!input.trim() || isLoading}
-          >
-            Send
-          </button>
+          <div className="input-actions">
+            <label className="web-search-toggle">
+              <input
+                type="checkbox"
+                checked={webSearch}
+                onChange={(e) => setWebSearch(e.target.checked)}
+                disabled={isLoading}
+              />
+              Web search
+            </label>
+            <button
+              type="submit"
+              className="send-button"
+              disabled={!input.trim() || isLoading}
+            >
+              Send
+            </button>
+          </div>
         </form>
       )}
     </div>

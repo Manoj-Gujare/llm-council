@@ -57,7 +57,7 @@ function App() {
     setCurrentConversationId(id);
   };
 
-  const handleSendMessage = async (content) => {
+  const handleSendMessage = async (content, webSearch) => {
     if (!currentConversationId) return;
 
     setIsLoading(true);
@@ -72,11 +72,14 @@ function App() {
       // Create a partial assistant message that will be updated progressively
       const assistantMessage = {
         role: 'assistant',
+        search: null,
         stage1: null,
         stage2: null,
         stage3: null,
         metadata: null,
         loading: {
+          search: false,
+          gap: false,
           stage1: false,
           stage2: false,
           stage3: false,
@@ -92,6 +95,48 @@ function App() {
       // Send message with streaming
       await api.sendMessageStream(currentConversationId, content, (eventType, event) => {
         switch (eventType) {
+          case 'search_start':
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              lastMsg.loading.search = true;
+              return { ...prev, messages };
+            });
+            break;
+
+          case 'search_complete':
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              lastMsg.search = { ...event.data, gap_queries: [] };
+              lastMsg.loading.search = false;
+              return { ...prev, messages };
+            });
+            break;
+
+          case 'gap_start':
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              lastMsg.loading.gap = true;
+              return { ...prev, messages };
+            });
+            break;
+
+          case 'gap_complete':
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              lastMsg.search = {
+                ...lastMsg.search,
+                gap_queries: event.data.queries,
+                sources: [...lastMsg.search.sources, ...event.data.sources],
+              };
+              lastMsg.loading.gap = false;
+              return { ...prev, messages };
+            });
+            break;
+
           case 'stage1_start':
             setCurrentConversation((prev) => {
               const messages = [...prev.messages];
@@ -163,13 +208,20 @@ function App() {
 
           case 'error':
             console.error('Stream error:', event.message);
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              lastMsg.loading.search = false;
+              lastMsg.loading.gap = false;
+              return { ...prev, messages };
+            });
             setIsLoading(false);
             break;
 
           default:
             console.log('Unknown event type:', eventType);
         }
-      });
+      }, webSearch);
     } catch (error) {
       console.error('Failed to send message:', error);
       // Remove optimistic messages on error
