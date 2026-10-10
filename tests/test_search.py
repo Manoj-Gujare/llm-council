@@ -1,4 +1,4 @@
-"""Tests for shared web search and gap-fill. Fully mocked: no network."""
+"""Tests for the web_search tool in Stage 1 and source handling in Stages 2-3. Fully mocked: no network."""
 
 import asyncio
 import json
@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from backend import council, search, storage
-from backend.config import COUNCIL_MODELS
+from backend.config import COUNCIL_MODELS, SEARCH_MAX_CALLS_PER_MODEL
 
 
 def run(coro):
@@ -24,20 +24,228 @@ def result(url, score=0.5, title=None):
     }
 
 
-def source(i, url):
-    return {"id": i, "title": url, "url": url, "content": f"content {i}", "published_date": None, "query": "q"}
-
-
-def ok_search(n=3, queries=("question",)):
-    sources = [source(i + 1, f"https://site{i + 1}.com/page") for i in range(n)]
+def tool_call(query, call_id="call_1"):
     return {
-        "status": "ok",
-        "queries": list(queries),
-        "gap_queries": [],
-        "sources": sources,
-        "context": search.build_context(sources),
+        "id": call_id,
+        "type": "function",
+        "function": {"name": "web_search", "arguments": json.dumps({"query": query})},
     }
 
+
+class ScriptedModel:
+    """Fake search.query_model: returns scripted replies in order, records every call."""
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    async def __call__(self, model, messages, timeout=120.0, tools=None, tool_choice=None):
+        self.calls.append({
+            "model": model,
+            "messages": [dict(m) for m in messages],
+            "tools": tools,
+            "tool_choice": tool_choice,
+        })
+        reply = self.replies.pop(0)
+        return reply(self.calls[-1]) if callable(reply) else reply
+
+
+class FakeTavily:
+    """Fake tavily_search: two results per query, URLs derived from the query."""
+
+    def __init__(self, results=None):
+        self.queries = []
+        self.results = results
+
+    async def __call__(self, query):
+        self.queries.append(query)
+        if self.results is not None:
+            return self.results
+        slug = query.replace(" ", "-")
+        return [result(f"https://{slug}.com/a"), result(f"https://{slug}.com/b")]
+
+
+def answer_with(fake_model, tavily=None, on_search=None):
+    tavily = tavily or FakeTavily()
+    with patch.object(search, "query_model", fake_model), \
+         patch.object(search, "tavily_search", tavily):
+        return run(search.answer_with_search("m1", "What is new?", on_search)), tavily
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def test_normalize_url_dedupes_case_slash_and_utm():
+    a = search.normalize_url("https://Example.COM/path/?utm_source=x&id=3&utm_medium=y")
+    b = search.normalize_url("https://example.com/path?id=3")
+    assert a == b
+
+
+def test_cited_sources_parses_single_and_grouped_citations():
+    sources = [{"id": i} for i in range(1, 6)]
+    cited = search.cited_sources("A [1], B [3, 4] and [9] and [x]", sources)
+    assert [s["id"] for s in cited] == [1, 3, 4]
+    assert search.cited_sources("no citations", sources) == []
+
+
+def test_parse_tool_query():
+    assert search.parse_tool_query(tool_call("  rust   2026 ")) == "rust 2026"
+    assert search.parse_tool_query({"function": {"name": "other", "arguments": "{}"}}) is None
+    assert search.parse_tool_query({"function": {"name": "web_search", "arguments": "not json"}}) is None
+    assert search.parse_tool_query({"function": {"name": "web_search", "arguments": '{"query": ""}'}}) is None
+
+
+def test_tavily_search_never_raises():
+    class Boom:
+        def __init__(self, *a, **k):
+            raise RuntimeError("network down")
+
+    with patch.object(search.httpx, "AsyncClient", Boom):
+        assert run(search.tavily_search("q")) == []
+
+
+# ---------------------------------------------------------------------------
+# answer_with_search: the tool loop
+# ---------------------------------------------------------------------------
+
+def test_model_answers_without_searching():
+    fake = ScriptedModel({"content": "2 + 2 = 4"})
+    out, tavily = answer_with(fake)
+    assert out == {"response": "2 + 2 = 4", "sources": [], "searches": []}
+    assert tavily.queries == []
+    call = fake.calls[0]
+    assert call["tools"] == [search.WEB_SEARCH_TOOL] and call["tool_choice"] == "auto"
+    assert call["messages"][0]["role"] == "system"
+    assert call["messages"][1] == {"role": "user", "content": "What is new?"}
+
+
+def test_one_search_round_then_answer():
+    fake = ScriptedModel(
+        {"content": "", "tool_calls": [tool_call("rust news")], "reasoning_details": [{"r": 1}]},
+        {"content": "Rust shipped [2]."},
+    )
+    seen = []
+    out, tavily = answer_with(fake, on_search=lambda m, q, n: seen.append((m, q, n)))
+
+    assert tavily.queries == ["rust news"]
+    assert out["response"] == "Rust shipped [2]."
+    assert [s["id"] for s in out["sources"]] == [1, 2]
+    assert out["sources"][0]["query"] == "rust news"
+    assert out["searches"] == [{"query": "rust news", "source_ids": [1, 2]}]
+    assert seen == [("m1", "rust news", 2)]
+
+    second = fake.calls[1]["messages"]
+    assistant, tool = second[2], second[3]
+    assert assistant["role"] == "assistant" and assistant["tool_calls"][0]["id"] == "call_1"
+    assert assistant["reasoning_details"] == [{"r": 1}]
+    assert tool["role"] == "tool" and tool["tool_call_id"] == "call_1"
+    assert "[1] https://rust-news.com/a" in tool["content"]
+    assert "[2] https://rust-news.com/b" in tool["content"]
+
+
+def test_search_cap_forces_final_answer():
+    keeps_searching = [
+        {"content": "", "tool_calls": [tool_call(f"q{i}", f"c{i}")]}
+        for i in range(SEARCH_MAX_CALLS_PER_MODEL)
+    ]
+    fake = ScriptedModel(*keeps_searching, {"content": "final answer"})
+    out, tavily = answer_with(fake)
+
+    assert len(tavily.queries) == SEARCH_MAX_CALLS_PER_MODEL
+    assert out["response"] == "final answer"
+    choices = [c["tool_choice"] for c in fake.calls]
+    assert choices == ["auto"] * SEARCH_MAX_CALLS_PER_MODEL + ["none"]
+
+
+def test_extra_parallel_calls_over_cap_are_refused():
+    calls = [tool_call(f"q{i}", f"c{i}") for i in range(SEARCH_MAX_CALLS_PER_MODEL + 2)]
+    fake = ScriptedModel({"content": "", "tool_calls": calls}, {"content": "done"})
+    out, tavily = answer_with(fake)
+
+    assert len(tavily.queries) == SEARCH_MAX_CALLS_PER_MODEL
+    tool_messages = [m for m in fake.calls[1]["messages"] if m["role"] == "tool"]
+    assert len(tool_messages) == len(calls)  # every call gets an answer
+    assert "Search limit reached" in tool_messages[-1]["content"]
+    assert fake.calls[1]["tool_choice"] == "none"
+    assert out["response"] == "done"
+
+
+def test_same_url_keeps_first_source_number():
+    fake = ScriptedModel(
+        {"content": "", "tool_calls": [tool_call("a", "c1")]},
+        {"content": "", "tool_calls": [tool_call("b", "c2")]},
+        {"content": "ok"},
+    )
+    tavily = FakeTavily(results=[result("https://same.com/x"), result("https://SAME.com/x/?utm_source=y")])
+    out, _ = answer_with(fake, tavily)
+    assert len(out["sources"]) == 1
+    assert out["searches"] == [{"query": "a", "source_ids": [1, 1]}, {"query": "b", "source_ids": [1, 1]}]
+
+
+def test_invalid_tool_call_gets_error_message_and_counts():
+    bad = {"id": "bad", "function": {"name": "web_search", "arguments": "{}"}}
+    fake = ScriptedModel({"content": "", "tool_calls": [bad]}, {"content": "ok"})
+    out, tavily = answer_with(fake)
+    assert tavily.queries == []
+    tool = fake.calls[1]["messages"][-1]
+    assert tool["tool_call_id"] == "bad" and "Invalid call" in tool["content"]
+    assert out["response"] == "ok"
+
+
+def test_no_results_message():
+    fake = ScriptedModel({"content": "", "tool_calls": [tool_call("x")]}, {"content": "ok"})
+    out, _ = answer_with(fake, FakeTavily(results=[]))
+    assert "No results found" in fake.calls[1]["messages"][-1]["content"]
+    assert out["sources"] == []
+
+
+def test_first_request_failure_retries_without_tools():
+    fake = ScriptedModel(None, {"content": "plain answer"})
+    out, _ = answer_with(fake)
+    assert out == {"response": "plain answer", "sources": [], "searches": []}
+    assert fake.calls[1]["tools"] is None
+    assert fake.calls[1]["messages"] == [{"role": "user", "content": "What is new?"}]
+
+
+def test_failure_after_searching_returns_none():
+    fake = ScriptedModel({"content": "", "tool_calls": [tool_call("x")]}, None)
+    out, _ = answer_with(fake)
+    assert out is None
+
+
+def test_both_requests_failing_returns_none():
+    out, _ = answer_with(ScriptedModel(None, None))
+    assert out is None
+
+
+# ---------------------------------------------------------------------------
+# Stage 1
+# ---------------------------------------------------------------------------
+
+def test_stage1_with_search_gives_each_model_its_own_loop():
+    async def fake_answer(model, query, on_search=None):
+        if model == COUNCIL_MODELS[1]:
+            return None
+        return {"response": f"{model} [1]", "sources": [{"id": 1, "url": "u", "content": "c"}], "searches": []}
+
+    with patch.object(council, "answer_with_search", fake_answer):
+        out = run(council.stage1_collect_responses("Q?", web_search=True))
+    assert [r["model"] for r in out] == [m for m in COUNCIL_MODELS if m != COUNCIL_MODELS[1]]
+    assert all(r["sources"][0]["id"] == 1 for r in out)
+
+
+def test_stage1_without_search_uses_plain_prompt():
+    rec = Recorder(stage_reply)
+    with patch.object(council, "query_models_parallel", rec):
+        out = run(council.stage1_collect_responses("Q?"))
+    assert set(rec.calls[0].values()) == {"Q?"}
+    assert all("sources" not in r for r in out)
+
+
+# ---------------------------------------------------------------------------
+# Stages 2-3: per-response sources
+# ---------------------------------------------------------------------------
 
 class Recorder:
     """Fake query_models_parallel that records every prompt per model."""
@@ -58,320 +266,49 @@ class Recorder:
 def stage_reply(model, prompt):
     if "FINAL RANKING:" in prompt:
         return {"content": "Good.\n\nFINAL RANKING:\n1. Response A\n2. Response B"}
-    return {"content": "an answer citing [1]"}
+    return {"content": "an answer"}
 
 
-# ---------------------------------------------------------------------------
-# URL dedupe and round-robin selection
-# ---------------------------------------------------------------------------
-
-def test_normalize_url_dedupes_case_slash_and_utm():
-    a = search.normalize_url("https://Example.COM/path/?utm_source=x&id=3&utm_medium=y")
-    b = search.normalize_url("https://example.com/path?id=3")
-    assert a == b
+def src(i, url):
+    return {"id": i, "title": f"T{i}", "url": url, "content": "x" * 2000, "published_date": None, "query": "q"}
 
 
-def test_round_robin_includes_every_query():
-    q1 = [result(f"https://a.com/{i}", score=0.99 - i * 0.01) for i in range(5)]
-    q2 = [result(f"https://b.com/{i}", score=0.20 - i * 0.01) for i in range(5)]
-    q3 = [result(f"https://c.com/{i}", score=0.10 - i * 0.01) for i in range(5)]
-    picked = search.select_round_robin([q1, q2, q3], 6)
-    hosts = [p["result"]["url"].split("/")[2] for p in picked]
-    assert hosts == ["a.com", "b.com", "c.com", "a.com", "b.com", "c.com"]
-    # Best-scored of each query comes first
-    assert picked[0]["result"]["url"] == "https://a.com/0"
+SEARCHED_STAGE1 = [
+    {"model": "m1", "response": "Claim one [2].", "sources": [src(1, "https://a.com"), src(2, "https://b.com")], "searches": []},
+    {"model": "m2", "response": "No search here.", "sources": [], "searches": []},
+]
 
 
-def test_round_robin_dedupes_urls_across_queries():
-    q1 = [result("https://same.com/x/", 0.9), result("https://a.com/2", 0.5)]
-    q2 = [result("https://SAME.com/x?utm_campaign=z", 0.9), result("https://b.com/2", 0.5)]
-    picked = search.select_round_robin([q1, q2], 10)
-    urls = [p["result"]["url"] for p in picked]
-    assert len(urls) == 3
-    assert "https://a.com/2" in urls and "https://b.com/2" in urls
-
-
-# ---------------------------------------------------------------------------
-# Stage 0
-# ---------------------------------------------------------------------------
-
-def test_stage0_merges_planner_and_raw_results():
-    async def fake_tavily(q):
-        return [result(f"https://{q.replace(' ', '-')}.com/{i}", 0.9 - i * 0.1) for i in range(5)]
-
-    with patch.object(search, "TAVILY_API_KEY", "key"), \
-         patch.object(search, "plan_search_queries", AsyncMock(return_value=["topic one", "topic two"])), \
-         patch.object(search, "tavily_search", side_effect=fake_tavily) as tav:
-        out = run(search.run_stage0_search("the question"))
-
-    assert out["status"] == "ok"
-    assert out["queries"] == ["the question", "topic one", "topic two"]
-    assert tav.call_count == 3
-    assert [s["id"] for s in out["sources"]] == list(range(1, 9))
-    assert {s["query"] for s in out["sources"]} == set(out["queries"])
-    assert "[1]" in out["context"] and "[8]" in out["context"]
-
-
-def test_stage0_planner_failure_uses_raw_results_only():
-    raw = [result(f"https://raw.com/{i}") for i in range(3)]
-    with patch.object(search, "TAVILY_API_KEY", "key"), \
-         patch.object(search, "plan_search_queries", AsyncMock(return_value=None)), \
-         patch.object(search, "tavily_search", AsyncMock(return_value=raw)) as tav:
-        out = run(search.run_stage0_search("q"))
-    assert out["status"] == "ok"
-    assert out["queries"] == ["q"]
-    assert tav.call_count == 1
-    assert len(out["sources"]) == 3
-
-
-def test_stage0_planner_empty_skips_search():
-    completed = []
-
-    async def slow_tavily(q):
-        await asyncio.sleep(5)
-        completed.append(q)
-        return [result("https://x.com")]
-
-    with patch.object(search, "TAVILY_API_KEY", "key"), \
-         patch.object(search, "plan_search_queries", AsyncMock(return_value=[])), \
-         patch.object(search, "tavily_search", side_effect=slow_tavily) as tav:
-        out = run(search.run_stage0_search("write a poem"))
-
-    assert out["status"] == "skipped"
-    assert out["sources"] == []
-    # Only the speculative raw-question search was started, and it was cancelled
-    # before finishing: no Tavily search completed and no planned queries ran.
-    assert completed == []
-    assert tav.call_count <= 1
-
-
-def test_stage0_no_key():
-    tav = AsyncMock()
-    with patch.object(search, "TAVILY_API_KEY", None), \
-         patch.object(search, "tavily_search", tav):
-        out = run(search.run_stage0_search("q"))
-    assert out["status"] == "no_key"
-    tav.assert_not_called()
-
-
-def test_stage0_all_searches_fail_status_failed():
-    with patch.object(search, "TAVILY_API_KEY", "key"), \
-         patch.object(search, "plan_search_queries", AsyncMock(return_value=["a b", "c d"])), \
-         patch.object(search, "tavily_search", AsyncMock(return_value=[])):
-        out = run(search.run_stage0_search("q"))
-    assert out["status"] == "failed"
-    assert out["queries"] == ["q", "a b", "c d"]
-    assert council.get_search_context(out) is None
-
-
-def test_tavily_search_never_raises():
-    class Boom:
-        def __init__(self, *a, **k):
-            raise RuntimeError("network down")
-
-    with patch.object(search.httpx, "AsyncClient", Boom):
-        assert run(search.tavily_search("q")) == []
-
-
-# ---------------------------------------------------------------------------
-# Gap-fill
-# ---------------------------------------------------------------------------
-
-def gap_reply(per_model):
-    def reply(model, prompt):
-        value = per_model.get(model)
-        if value is None:
-            return None
-        return {"content": value}
-    return reply
-
-
-def test_gap_fill_ids_stable_and_cross_model_dupes_merged():
-    m = COUNCIL_MODELS
-    per_model = {
-        m[0]: '{"queries": ["battery recycling rates 2026"]}',
-        m[1]: 'Sure: {"queries": ["Battery  Recycling Rates 2026", "lithium price trend"]}',
-        m[2]: '{"queries": []}',
-    }
-    rec = Recorder(gap_reply(per_model))
-    base = ok_search(3)
-
-    async def fake_tavily(q):
-        slug = q.replace(" ", "-")
-        return [result(f"https://{slug}.com/{i}", 0.9 - i * 0.1) for i in range(4)] + [
-            result("https://site1.com/page/", 0.95)  # duplicate of existing source 1
-        ]
-
-    with patch.object(council, "query_models_parallel", rec), \
-         patch.object(council, "tavily_search", side_effect=fake_tavily):
-        updated, added = run(council.stage0_5_gap_fill("question", base))
-
-    queries = [q["query"] for q in added["queries"]]
-    assert queries == ["battery recycling rates 2026", "lithium price trend"]
-    assert added["queries"][0]["requested_by"] == [m[0], m[1]]
-
-    # Existing IDs untouched, new IDs continue the numbering
-    assert updated["sources"][:3] == base["sources"]
-    assert [s["id"] for s in updated["sources"]] == [1, 2, 3, 4, 5, 6, 7]
-    # Per-query cap, and the duplicate of source 1 was not re-added
-    assert len(added["sources"]) == 4
-    assert all("site1.com" not in s["url"] for s in added["sources"])
-    assert "[7]" in updated["context"]
-
-
-def test_gap_fill_prompt_identical_and_has_no_attribution():
-    rec = Recorder('{"queries": []}')
-    with patch.object(council, "query_models_parallel", rec), \
-         patch.object(council, "tavily_search", AsyncMock(return_value=[])):
-        run(council.stage0_5_gap_fill("question", ok_search(2)))
-    prompts = set(rec.calls[0].values())
-    assert len(prompts) == 1
-    prompt = prompts.pop()
-    for model in COUNCIL_MODELS:
-        assert model not in prompt
-
-
-def test_gap_fill_bad_json_from_one_model_is_ignored():
-    m = COUNCIL_MODELS
-    per_model = {
-        m[0]: "I think you should search for {not json",
-        m[1]: '{"queries": ["solar capacity india"]}',
-        m[2]: None,  # model failed entirely
-        m[3]: '{"queries": "not a list"}',
-    }
-    rec = Recorder(gap_reply(per_model))
-    with patch.object(council, "query_models_parallel", rec), \
-         patch.object(council, "tavily_search", AsyncMock(return_value=[result("https://new.com/a")])):
-        updated, added = run(council.stage0_5_gap_fill("question", ok_search(2)))
-    assert [q["query"] for q in added["queries"]] == ["solar capacity india"]
-    assert updated["sources"][-1]["id"] == 3
-
-
-def test_merge_gap_queries_caps_and_round_robin():
-    requests = {
-        "m1": ["alpha one", "alpha two", "alpha three"],  # third exceeds per-model cap
-        "m2": ["beta one", "beta two"],
-        "m3": ["gamma one", "gamma two"],
-        "m4": ["delta one", "delta two"],
-    }
-    merged = council.merge_gap_queries(requests, ["original question"])
-    queries = [q["query"] for q in merged]
-    assert len(queries) == 6  # GAP_MAX_TOTAL_QUERIES
-    assert "alpha three" not in queries
-    # Round-robin: every model's first request comes before any second request
-    assert queries[:4] == ["alpha one", "beta one", "gamma one", "delta one"]
-
-
-def test_merge_gap_queries_drops_stage0_and_near_duplicates():
-    requests = {
-        "m1": ["Original  Question", "new zealand housing prices 2026 forecast"],
-        "m2": ["housing prices new zealand 2026 forecast data"],  # Jaccard 6/7 >= 0.7
-    }
-    merged = council.merge_gap_queries(requests, ["original question"])
-    # Round 1: m1's first request repeats Stage 0 and is dropped; m2's is accepted.
-    # Round 2: m1's second request is a near-duplicate and only adds attribution.
-    assert [q["query"] for q in merged] == ["housing prices new zealand 2026 forecast data"]
-    assert merged[0]["requested_by"] == ["m2", "m1"]
-
-
-def test_gap_fill_respects_pool_cap():
-    m = COUNCIL_MODELS
-    per_model = {model: f'{{"queries": ["topic {i} a", "topic {i} b"]}}' for i, model in enumerate(m)}
-    rec = Recorder(gap_reply(per_model))
-
-    async def fake_tavily(q):
-        slug = q.replace(" ", "-")
-        return [result(f"https://{slug}.com/{i}") for i in range(3)]
-
-    base = ok_search(8)
-    with patch.object(council, "query_models_parallel", rec), \
-         patch.object(council, "tavily_search", side_effect=fake_tavily):
-        updated, added = run(council.stage0_5_gap_fill("question", base))
-    assert len(updated["sources"]) == 12  # SEARCH_MAX_SOURCES_TOTAL
-    assert [s["id"] for s in updated["sources"]] == list(range(1, 13))
-
-
-def test_gap_fill_skipped_unless_status_ok():
-    rec = Recorder()
-    with patch.object(council, "query_models_parallel", rec):
-        for status in ("failed", "skipped", "no_key"):
-            s = {"status": status, "queries": [], "gap_queries": [], "sources": [], "context": ""}
-            out, added = run(council.stage0_5_gap_fill("q", s))
-            assert out is s and added == {"queries": [], "sources": []}
-        out, _ = run(council.stage0_5_gap_fill("q", None))
-        assert out is None
-    assert rec.calls == []
-
-
-# ---------------------------------------------------------------------------
-# Prompts: identical evidence, no attribution, original prompts when off
-# ---------------------------------------------------------------------------
-
-def run_council_with(search_result, web_search=True):
+def test_stage2_lists_only_cited_sources_per_response():
     rec = Recorder(stage_reply)
-    chair = AsyncMock(return_value={"content": "final [1]"})
-    with patch.object(council, "query_models_parallel", rec), \
-         patch.object(council, "query_model", chair), \
-         patch.object(council, "run_stage0_search", AsyncMock(return_value=search_result)), \
-         patch.object(council, "GAP_FILL_ENABLED", False):
-        out = run(council.run_full_council("What is new?", web_search=web_search))
-    return out, rec, chair
+    with patch.object(council, "query_models_parallel", rec):
+        run(council.stage2_collect_rankings("Q?", SEARCHED_STAGE1))
+    prompt = next(iter(rec.calls[0].values()))
+
+    assert "Sources cited by Response A:\n[2] T2\nURL: https://b.com" in prompt
+    assert "https://a.com" not in prompt  # retrieved but not cited
+    assert "Sources cited by Response B" not in prompt
+    assert "x" * (council.REVIEW_SNIPPET_CHARS + 1) not in prompt  # snippets trimmed
+    assert "Fact-check claims against those sources" in prompt
+    for model in ("m1", "m2"):
+        assert model not in prompt  # still anonymous
 
 
-def test_all_stages_get_identical_evidence_block():
-    s = ok_search(3)
-    s["gap_queries"] = [{"query": "extra", "requested_by": [COUNCIL_MODELS[0]]}]
-    (_, _, _, metadata), rec, chair = run_council_with(s)
-    block = search.evidence_block(s["context"])
-
-    stage1_prompts, stage2_prompts = rec.calls
-    # Stage 1 prompt byte-identical across models
-    assert len(set(stage1_prompts.values())) == 1
-    assert len(set(stage2_prompts.values())) == 1
-    stage3_prompt = chair.call_args.args[1][0]["content"]
-    for prompt in (next(iter(stage1_prompts.values())), next(iter(stage2_prompts.values())), stage3_prompt):
-        assert block in prompt
-
-    # Stage 1 and 2 prompts reveal no model identity
-    for prompt in (next(iter(stage1_prompts.values())), next(iter(stage2_prompts.values()))):
-        for model in COUNCIL_MODELS:
-            assert model not in prompt
-    assert "requested_by" not in stage3_prompt
-    assert metadata["search"]["status"] == "ok"
-    assert all("content" not in src for src in metadata["search"]["sources"])
+def test_stage3_gets_sources_and_link_instructions():
+    chair = AsyncMock(return_value={"content": "final"})
+    with patch.object(council, "query_model", chair):
+        run(council.stage3_synthesize_final("Q?", SEARCHED_STAGE1, [{"model": "m1", "ranking": "R"}]))
+    prompt = chair.call_args.args[1][0]["content"]
+    assert "Sources cited by this response:\n[2] T2" in prompt
+    assert "markdown links [title](url)" in prompt
 
 
-ORIGINAL_STAGE2_TASK = "1. First, evaluate each response individually. For each response, explain what it does well and what it does poorly.\n2. Then"
-ORIGINAL_STAGE3_START = "You are the Chairman of an LLM Council."
-ORIGINAL_STAGE3_LIST = "- Any patterns of agreement or disagreement\n\nProvide a clear"
-
-
-@pytest.mark.parametrize("web_search, search_result", [
-    (False, None),
-    (True, {"status": "failed", "queries": ["q"], "gap_queries": [], "sources": [], "context": ""}),
-    (True, {"status": "skipped", "queries": [], "gap_queries": [], "sources": [], "context": ""}),
-    (True, {"status": "no_key", "queries": [], "gap_queries": [], "sources": [], "context": ""}),
-])
-def test_prompts_are_original_when_search_off_or_not_ok(web_search, search_result):
-    (s1, s2, s3, metadata), rec, chair = run_council_with(search_result, web_search)
-    stage1_prompts, stage2_prompts = rec.calls
-    assert set(stage1_prompts.values()) == {"What is new?"}
-    stage2_prompt = next(iter(stage2_prompts.values()))
-    assert stage2_prompt.startswith("You are evaluating different responses")
-    assert ORIGINAL_STAGE2_TASK in stage2_prompt
-    stage3_prompt = chair.call_args.args[1][0]["content"]
-    assert stage3_prompt.startswith(ORIGINAL_STAGE3_START)
-    assert ORIGINAL_STAGE3_LIST in stage3_prompt
-    assert "WEB SEARCH RESULTS" not in stage2_prompt + stage3_prompt
-    # Council still completes
-    assert len(s1) == len(COUNCIL_MODELS) and s3["response"] == "final [1]"
-    if web_search is False:
-        assert metadata["search"] is None
-
-
-def test_prompts_without_context_match_original_code_exactly():
-    """With no context, prompts must equal what the pre-search code produced."""
-    stage1 = [{"model": "m1", "response": "r1"}, {"model": "m2", "response": "r2"}]
+def test_prompts_without_citations_match_original_code_exactly():
+    """With no cited sources, prompts must equal what the pre-search code produced."""
+    stage1 = [
+        {"model": "m1", "response": "r1"},
+        {"model": "m2", "response": "r2", "sources": [src(1, "https://a.com")], "searches": []},
+    ]
     rec = Recorder(stage_reply)
     chair = AsyncMock(return_value={"content": "x"})
     with patch.object(council, "query_models_parallel", rec), \
@@ -441,7 +378,45 @@ Provide a clear, well-reasoned final answer that represents the council's collec
 
 
 # ---------------------------------------------------------------------------
-# SSE endpoint
+# Full council
+# ---------------------------------------------------------------------------
+
+def run_council(web_search, key="tvly-test"):
+    async def fake_answer(model, query, on_search=None):
+        return {"response": "cited [1]", "sources": [src(1, f"https://{model}.com")], "searches": [{"query": "q", "source_ids": [1]}]}
+
+    rec = Recorder(stage_reply)
+    with patch.object(council, "query_models_parallel", rec), \
+         patch.object(council, "query_model", AsyncMock(return_value={"content": "final"})), \
+         patch.object(council, "answer_with_search", fake_answer), \
+         patch.object(council, "TAVILY_API_KEY", key):
+        return run(council.run_full_council("Q?", web_search=web_search)), rec
+
+
+def test_full_council_with_search_returns_public_sources():
+    (s1, s2, s3, metadata), rec = run_council(True)
+    assert metadata["search"] == {"status": "tool"}
+    assert len(s1) == len(COUNCIL_MODELS)
+    assert all("content" not in s for r in s1 for s in r["sources"])
+    # Stage 2 prompt still got the snippets
+    assert "Sources cited by Response A" in next(iter(rec.calls[0].values()))
+    assert s3["response"] == "final"
+
+
+@pytest.mark.parametrize("web_search, key, status", [
+    (False, "tvly-test", None),
+    (True, None, {"status": "no_key"}),
+])
+def test_full_council_plain_when_search_off_or_no_key(web_search, key, status):
+    (s1, _, s3, metadata), rec = run_council(web_search, key)
+    assert metadata["search"] == status
+    assert set(rec.calls[0].values()) == {"Q?"}  # plain Stage 1 prompt
+    assert all("sources" not in r for r in s1)
+    assert s3["response"] == "final"
+
+
+# ---------------------------------------------------------------------------
+# HTTP endpoints
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -454,12 +429,20 @@ def client(tmp_path, monkeypatch):
     return TestClient(main.app)
 
 
-def stream_events(client, body, search_result):
+def searching_answer(model, query, on_search=None):
+    async def go():
+        if on_search is not None:
+            on_search(model, "q " + model, 1)
+        return {"response": "cited [1]", "sources": [src(1, "https://a.com")], "searches": [{"query": "q", "source_ids": [1]}]}
+    return go()
+
+
+def stream_events(client, body, key="tvly-test"):
     rec = Recorder(stage_reply)
     with patch.object(council, "query_models_parallel", rec), \
          patch.object(council, "query_model", AsyncMock(return_value={"content": "final"})), \
-         patch.object(council, "run_stage0_search", AsyncMock(return_value=search_result)) as s0, \
-         patch.object(council, "tavily_search", AsyncMock(return_value=[result("https://gap.com/1")])):
+         patch.object(council, "answer_with_search", searching_answer), \
+         patch.object(council, "TAVILY_API_KEY", key):
         conv = client.post("/api/conversations", json={}).json()
         resp = client.post(f"/api/conversations/{conv['id']}/message/stream", json=body)
         events = [
@@ -467,57 +450,60 @@ def stream_events(client, body, search_result):
             if line.startswith("data: ")
         ]
         saved = client.get(f"/api/conversations/{conv['id']}").json()
-    return events, saved, s0
+    return events, saved
 
 
-def test_sse_event_order_search_on(client):
-    events, saved, _ = stream_events(client, {"content": "Q?", "web_search": True}, ok_search(2))
+def test_sse_search_on_streams_progress_per_model(client):
+    events, saved = stream_events(client, {"content": "Q?", "web_search": True})
     types = [e["type"] for e in events]
-    assert types == [
-        "search_start", "search_complete", "gap_start", "gap_complete",
-        "stage1_start", "stage1_complete", "stage2_start", "stage2_complete",
-        "stage3_start", "stage3_complete", "title_complete", "complete",
-    ]
-    search_complete = events[1]["data"]
-    assert search_complete["status"] == "ok" and len(search_complete["sources"]) == 2
-    assert "context" not in search_complete
+    n = len(COUNCIL_MODELS)
+    assert types == (
+        ["stage1_start"] + ["search_progress"] * n
+        + ["stage1_complete", "stage2_start", "stage2_complete",
+           "stage3_start", "stage3_complete", "title_complete", "complete"]
+    )
+    assert events[0]["search"] == {"status": "tool"}
+    assert {e["data"]["model"] for e in events[1:1 + n]} == set(COUNCIL_MODELS)
+
+    stage1 = events[1 + n]["data"]
+    assert all("content" not in s for r in stage1 for s in r["sources"])
 
     msg = saved["messages"][-1]
-    assert msg["search"]["status"] == "ok"
-    assert "context" not in msg["search"]
+    assert msg["search"] == {"status": "tool"}
+    assert msg["stage1"][0]["sources"][0]["url"] == "https://a.com"
+    assert "content" not in msg["stage1"][0]["sources"][0]
 
 
-def test_sse_event_order_search_off(client):
-    events, saved, s0 = stream_events(client, {"content": "Q?", "web_search": False}, ok_search(2))
+def test_sse_search_off(client):
+    events, saved = stream_events(client, {"content": "Q?", "web_search": False})
     types = [e["type"] for e in events]
     assert types == [
         "stage1_start", "stage1_complete", "stage2_start", "stage2_complete",
         "stage3_start", "stage3_complete", "title_complete", "complete",
     ]
-    s0.assert_not_called()
+    assert events[0]["search"] is None
     assert "search" not in saved["messages"][-1]
 
 
-def test_sse_search_failed_still_completes(client):
-    failed = {"status": "failed", "queries": ["Q?"], "gap_queries": [], "sources": [], "context": ""}
-    events, _, _ = stream_events(client, {"content": "Q?", "web_search": True}, failed)
-    types = [e["type"] for e in events]
-    assert types[:3] == ["search_start", "search_complete", "stage1_start"]
-    assert events[1]["data"]["status"] == "failed"
-    assert types[-1] == "complete"
+def test_sse_no_key_still_completes(client):
+    events, saved = stream_events(client, {"content": "Q?", "web_search": True}, key=None)
+    assert events[0]["search"] == {"status": "no_key"}
+    assert "search_progress" not in [e["type"] for e in events]
+    assert events[-1]["type"] == "complete"
+    assert saved["messages"][-1]["search"] == {"status": "no_key"}
 
 
-def test_non_streaming_endpoint_persists_search(client):
+def test_non_streaming_endpoint_persists_sources(client):
     rec = Recorder(stage_reply)
     with patch.object(council, "query_models_parallel", rec), \
          patch.object(council, "query_model", AsyncMock(return_value={"content": "final"})), \
-         patch.object(council, "run_stage0_search", AsyncMock(return_value=ok_search(2))), \
-         patch.object(council, "GAP_FILL_ENABLED", False):
+         patch.object(council, "answer_with_search", searching_answer), \
+         patch.object(council, "TAVILY_API_KEY", "tvly-test"):
         conv = client.post("/api/conversations", json={}).json()
         data = client.post(f"/api/conversations/{conv['id']}/message", json={"content": "Q?"}).json()
         saved = client.get(f"/api/conversations/{conv['id']}").json()
-    assert data["metadata"]["search"]["status"] == "ok"
-    assert saved["messages"][-1]["search"]["sources"][0]["id"] == 1
+    assert data["metadata"]["search"] == {"status": "tool"}
+    assert saved["messages"][-1]["stage1"][0]["sources"][0]["id"] == 1
 
 
 def test_old_conversation_without_search_loads(client):

@@ -20,33 +20,19 @@ function formatDate(value) {
   });
 }
 
-function shortModel(model) {
-  return model.split('/')[1] || model;
-}
+/**
+ * Numbered web sources with the queries that found them.
+ * Used per model in Stage 1, and for older conversations that stored one shared pool.
+ */
+export default function Sources({ sources, queries = [], note, defaultExpanded = true }) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
 
-export default function Sources({ search }) {
-  const [expanded, setExpanded] = useState(true);
-
-  if (!search) {
+  if (!sources?.length && !queries.length) {
     return null;
   }
-
-  if (search.status === 'failed') {
-    return (
-      <div className="sources-warning">
-        Web search failed — council answered without sources
-      </div>
-    );
-  }
-
-  if (search.status !== 'ok' || !search.sources?.length) {
-    return null;
-  }
-
-  const gapQueries = search.gap_queries || [];
 
   return (
-    <div className="stage sources">
+    <div className="sources">
       <button
         type="button"
         className="sources-header"
@@ -54,61 +40,51 @@ export default function Sources({ search }) {
         aria-expanded={expanded}
       >
         <span className="stage-title">
-          Web Sources ({search.sources.length})
+          Web Sources ({sources?.length || 0})
         </span>
         <span className="sources-toggle">{expanded ? 'Hide' : 'Show'}</span>
       </button>
 
       {expanded && (
         <div className="sources-body">
-          <p className="sources-note">
-            Every council member received these exact sources.
-          </p>
+          {note && <p className="sources-note">{note}</p>}
 
-          <div className="query-chips">
-            {search.queries.map((query, i) => (
-              <span key={`q-${i}`} className="query-chip">
-                {query}
-              </span>
-            ))}
-            {gapQueries.map((gap, i) => (
-              <span
-                key={`g-${i}`}
-                className="query-chip gap"
-                title={`Gap-fill, requested by: ${gap.requested_by
-                  .map(shortModel)
-                  .join(', ')}`}
-              >
-                + {gap.query}
-              </span>
-            ))}
-          </div>
+          {queries.length > 0 && (
+            <div className="query-chips">
+              {queries.map((query, i) => (
+                <span key={i} className="query-chip">
+                  {query}
+                </span>
+              ))}
+            </div>
+          )}
 
-          <ol className="source-list">
-            {search.sources.map((source) => {
-              const date = formatDate(source.published_date);
-              return (
-                <li key={source.id} className="source-item">
-                  <span className="source-id">[{source.id}]</span>
-                  <div className="source-info">
-                    <a
-                      href={source.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="source-title"
-                    >
-                      {source.title}
-                    </a>
-                    <div className="source-meta">
-                      <span>{getDomain(source.url)}</span>
-                      {date && <span>{date}</span>}
-                      {source.gap && <span className="source-gap">gap-fill</span>}
+          {sources?.length > 0 && (
+            <ol className="source-list">
+              {sources.map((source) => {
+                const date = formatDate(source.published_date);
+                return (
+                  <li key={source.id} className="source-item">
+                    <span className="source-id">[{source.id}]</span>
+                    <div className="source-info">
+                      <a
+                        href={source.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="source-title"
+                      >
+                        {source.title}
+                      </a>
+                      <div className="source-meta">
+                        <span>{getDomain(source.url)}</span>
+                        {date && <span>{date}</span>}
+                      </div>
                     </div>
-                  </div>
-                </li>
-              );
-            })}
-          </ol>
+                  </li>
+                );
+              })}
+            </ol>
+          )}
         </div>
       )}
     </div>

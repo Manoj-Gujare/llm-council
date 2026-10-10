@@ -142,7 +142,7 @@ def add_assistant_message(
         stage1: List of individual model responses
         stage2: List of model rankings
         stage3: Final synthesized response
-        search: Web search info (status, queries, gap queries, sources), or None
+        search: Web search status ({"status": "tool" | "no_key"}), or None
     """
     conversation = get_conversation(conversation_id)
     if conversation is None:
