@@ -48,18 +48,18 @@ Edit `backend/config.py` to customize the council:
 
 ```python
 COUNCIL_MODELS = [
-    "openai/gpt-5.1",
-    "google/gemini-3-pro-preview",
-    "anthropic/claude-sonnet-4.5",
-    "x-ai/grok-4",
+    "openai/gpt-5.6-sol",
+    "google/gemini-3.1-pro-preview",
+    "anthropic/claude-sonnet-5.5",
+    "x-ai/grok-4.7",
 ]
 
-CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
+CHAIRMAN_MODEL = "google/gemini-3.1-pro-preview"
 ```
 
 ## Web Search
 
-The council can ground its answers in shared web search results from [Tavily](https://tavily.com/).
+Each council model gets a `web_search` tool backed by [Tavily](https://tavily.com/) and decides for itself whether and what to search.
 
 **Setup:** add a Tavily key to `.env`:
 
@@ -69,32 +69,24 @@ TAVILY_API_KEY=tvly-...
 
 Without a key the council runs exactly as before. Use the "Web search" checkbox next to Send to turn search on or off for a question.
 
-**Fairness design:** every council member competes on identical evidence.
+**How it works:**
 
-1. **Stage 0 (shared search):** a planner model proposes up to 3 queries while the raw question is searched in parallel. Sources are picked round-robin across queries, deduped by URL, and numbered [1]..[N]. If the planner says no search is needed (coding, math, creative writing), search is skipped.
-2. **Stage 0.5 (gap-fill):** each council model may request up to 2 extra queries. Requests are merged (duplicates and near-duplicates dropped, picked round-robin across models) and the results are appended to the same shared pool. Source numbers never change once assigned.
-3. **Stages 1-3:** every prompt contains the byte-identical evidence block. Models cite sources as [n], judges fact-check answers against the sources, and the chairman keeps the citations. Prompts never reveal which model requested which query; that attribution is shown only in the UI.
+1. **Stage 1:** every model answers with the `web_search` tool available (up to 3 calls each). Each model keeps its own numbered sources [1]..[N] and cites them as [n]. Different models can find different evidence, which gives the debate something real to disagree about. A model that rejects tools falls back to a plain answer.
+2. **Stage 2:** each anonymized response is shown with the sources it actually cited (snippets trimmed). Judges fact-check claims against those sources and are told not to penalize a correct answer just for not searching.
+3. **Stage 3:** the chairman sees every response with its cited sources and cites them in the final answer as markdown links, since source numbers are per response.
 
-Models never search on their own. If search is off or finds nothing, the prompts are exactly the original ones.
+The UI shows live search progress during Stage 1 and each model's queries and sources in its Stage 1 tab. If no response cites a source, the Stage 2/3 prompts are exactly the original ones.
 
 **Config knobs** (`backend/config.py`):
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `WEB_SEARCH_DEFAULT` | `true` (env) | Search when the request doesn't say |
-| `SEARCH_PLANNER_MODEL` | `google/gemini-2.5-flash` | Model that plans Stage 0 queries |
-| `SEARCH_MAX_QUERIES` | 3 | Planner query limit |
+| `SEARCH_MAX_CALLS_PER_MODEL` | 3 | `web_search` calls allowed per model in Stage 1 |
 | `SEARCH_RESULTS_PER_QUERY` | 5 | Tavily results per query |
-| `SEARCH_MAX_SOURCES` | 8 | Stage 0 pool size |
 | `SEARCH_DEPTH` | `basic` | Tavily search depth (`basic` or `advanced`) |
-| `SEARCH_SNIPPET_CHARS` | 1000 | Snippet length per source in prompts |
-| `GAP_FILL_ENABLED` | `true` (env) | Run Stage 0.5 |
-| `GAP_MAX_QUERIES_PER_MODEL` | 2 | Gap queries each model may request |
-| `GAP_MAX_TOTAL_QUERIES` | 6 | Gap queries run in total |
-| `GAP_SOURCES_PER_QUERY` | 2 | New sources added per gap query |
-| `SEARCH_MAX_SOURCES_TOTAL` | 12 | Hard cap on the final pool |
-
-**Don't use OpenRouter's `:online` suffix for council models.** It makes each model search on its own, so they would answer from different evidence and the peer review would no longer be fair.
+| `SEARCH_SNIPPET_CHARS` | 1000 | Snippet length the searching model sees |
+| `REVIEW_SNIPPET_CHARS` | 300 | Snippet length in Stage 2/3 prompts |
 
 Run the tests with `uv run pytest`.
 

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
+import Sources from './Sources';
 import './Stage1.css';
 
 export default function Stage1({ responses }) {
@@ -30,6 +31,13 @@ export default function Stage1({ responses }) {
         <div className="response-text markdown-content">
           <ReactMarkdown>{responses[activeTab].response}</ReactMarkdown>
         </div>
+        {/* Searches this model chose to run with the web_search tool */}
+        <Sources
+          key={activeTab}
+          sources={responses[activeTab].sources}
+          queries={(responses[activeTab].searches || []).map((s) => s.query)}
+          defaultExpanded={false}
+        />
       </div>
     </div>
   );

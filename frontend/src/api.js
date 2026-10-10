@@ -71,7 +71,7 @@ export const api = {
    * @param {string} conversationId - The conversation ID
    * @param {string} content - The message content
    * @param {function} onEvent - Callback function for each event: (eventType, data) => void
-   * @param {boolean} webSearch - Run shared web search before Stage 1
+   * @param {boolean} webSearch - Give council models the web_search tool in Stage 1
    * @returns {Promise<void>}
    */
   async sendMessageStream(conversationId, content, onEvent, webSearch = true) {

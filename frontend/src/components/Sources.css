@@ -1,3 +1,9 @@
+.tab-content .sources {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid #eee;
+}
+
 .sources-header {
   display: flex;
   align-items: center;
@@ -44,13 +50,6 @@
   border-radius: 12px;
   font-size: 12px;
   color: #2c5d94;
-}
-
-.query-chip.gap {
-  background: #fff7e8;
-  border: 1px dashed #e0b45c;
-  color: #8a5a00;
-  cursor: help;
 }
 
 .source-list {
@@ -103,10 +102,6 @@
   color: #888;
 }
 
-.source-gap {
-  color: #8a5a00;
-}
-
 .sources-warning {
   margin: 12px 0;
   padding: 10px 14px;
@@ -115,4 +110,21 @@
   border-radius: 8px;
   font-size: 13px;
   color: #7a5b00;
+}
+
+.search-progress {
+  list-style: none;
+  margin: 8px 0 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: #666;
+}
+
+.search-progress-model {
+  font-family: monospace;
+  color: #4a90e2;
+  margin-right: 6px;
 }

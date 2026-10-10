@@ -7,8 +7,10 @@ from .config import OPENROUTER_API_KEY, OPENROUTER_API_URL
 
 async def query_model(
     model: str,
-    messages: List[Dict[str, str]],
-    timeout: float = 120.0
+    messages: List[Dict[str, Any]],
+    timeout: float = 120.0,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Query a single model via OpenRouter API.
@@ -17,9 +19,12 @@ async def query_model(
         model: OpenRouter model identifier (e.g., "openai/gpt-4o")
         messages: List of message dicts with 'role' and 'content'
         timeout: Request timeout in seconds
+        tools: Optional tool definitions (OpenAI function-calling format)
+        tool_choice: Optional "auto" / "none"
 
     Returns:
-        Response dict with 'content' and optional 'reasoning_details', or None if failed
+        Response dict with 'content', optional 'reasoning_details' and
+        optional 'tool_calls', or None if failed
     """
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -30,6 +35,10 @@ async def query_model(
         "model": model,
         "messages": messages,
     }
+    if tools:
+        payload["tools"] = tools
+    if tool_choice:
+        payload["tool_choice"] = tool_choice
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -45,7 +54,8 @@ async def query_model(
 
             return {
                 'content': message.get('content'),
-                'reasoning_details': message.get('reasoning_details')
+                'reasoning_details': message.get('reasoning_details'),
+                'tool_calls': message.get('tool_calls')
             }
 
     except Exception as e:

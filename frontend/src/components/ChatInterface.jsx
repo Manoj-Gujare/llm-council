@@ -74,26 +74,42 @@ export default function ChatInterface({
                 <div className="assistant-message">
                   <div className="message-label">LLM Council</div>
 
-                  {/* Stage 0 / 0.5: Shared web search */}
-                  {msg.loading?.search && (
-                    <div className="stage-loading">
-                      <div className="spinner"></div>
-                      <span>Searching the web...</span>
+                  {msg.search?.status === 'no_key' && (
+                    <div className="sources-warning">
+                      Web search unavailable (TAVILY_API_KEY not set) — council answered without it
                     </div>
                   )}
-                  {msg.loading?.gap && (
-                    <div className="stage-loading">
-                      <div className="spinner"></div>
-                      <span>Council is checking for missing information...</span>
+
+                  {/* Older conversations: one shared source pool for every model */}
+                  {msg.search?.sources?.length > 0 && (
+                    <div className="stage">
+                      <Sources
+                        sources={msg.search.sources}
+                        queries={msg.search.queries}
+                        note="Every council member received these exact sources."
+                      />
                     </div>
                   )}
-                  {msg.search && <Sources search={msg.search} />}
 
                   {/* Stage 1 */}
                   {msg.loading?.stage1 && (
                     <div className="stage-loading">
                       <div className="spinner"></div>
-                      <span>Running Stage 1: Collecting individual responses...</span>
+                      <div>
+                        <span>Running Stage 1: Collecting individual responses...</span>
+                        {msg.searchProgress?.length > 0 && (
+                          <ul className="search-progress">
+                            {msg.searchProgress.map((p, i) => (
+                              <li key={i}>
+                                <span className="search-progress-model">
+                                  {p.model.split('/')[1] || p.model}
+                                </span>
+                                searched “{p.query}” ({p.results} results)
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
                     </div>
                   )}
                   {msg.stage1 && <Stage1 responses={msg.stage1} />}
