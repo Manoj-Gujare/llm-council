@@ -31,6 +31,11 @@ export default function Stage1({ responses }) {
         <div className="response-text markdown-content">
           <ReactMarkdown>{responses[activeTab].response}</ReactMarkdown>
         </div>
+        {responses[activeTab].search_failed && (
+          <div className="sources-warning">
+            Web search failed for this model — it answered without searching
+          </div>
+        )}
         {/* Searches this model chose to run with the web_search tool */}
         <Sources
           key={activeTab}
