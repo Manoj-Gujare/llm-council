@@ -203,7 +203,8 @@ async def answer_with_search(
     fails (for example the model rejects tools), retry once without tools.
 
     Returns:
-        {"response": str, "sources": [...], "searches": [{"query", "source_ids"}]}
+        {"response": str, "sources": [...], "searches": [{"query", "source_ids"}]},
+        plus "search_failed": True when it fell back to answering without the tool,
         or None if the model failed.
     """
     messages: List[Dict[str, Any]] = [
@@ -226,10 +227,18 @@ async def answer_with_search(
 
         if response is None:
             if calls_used == 0:
+                # query_model already retried transient errors, so the tool request
+                # itself failed; answer without search rather than drop the model
+                print(f"Model {model} failed with the web_search tool; answering without search")
                 fallback = await query_model(model, [{"role": "user", "content": user_query}])
                 if fallback is None:
                     return None
-                return {"response": fallback.get("content") or "", "sources": [], "searches": []}
+                return {
+                    "response": fallback.get("content") or "",
+                    "sources": [],
+                    "searches": [],
+                    "search_failed": True,
+                }
             return None
 
         tool_calls = response.get("tool_calls") or []

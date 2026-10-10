@@ -22,6 +22,11 @@ CHAIRMAN_MODEL = "google/gemini-3.1-pro-preview"
 # OpenRouter API endpoint
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# Retries for transient OpenRouter errors (rate limits, provider outages)
+OPENROUTER_MAX_RETRIES = 2
+OPENROUTER_RETRY_BACKOFF = 2.0  # seconds; doubles each retry unless Retry-After says otherwise
+OPENROUTER_MAX_RETRY_AFTER = 30.0  # cap on a server-requested wait
+
 # Data directory for conversation storage
 DATA_DIR = "data/conversations"
 

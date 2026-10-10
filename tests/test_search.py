@@ -203,7 +203,7 @@ def test_no_results_message():
 def test_first_request_failure_retries_without_tools():
     fake = ScriptedModel(None, {"content": "plain answer"})
     out, _ = answer_with(fake)
-    assert out == {"response": "plain answer", "sources": [], "searches": []}
+    assert out == {"response": "plain answer", "sources": [], "searches": [], "search_failed": True}
     assert fake.calls[1]["tools"] is None
     assert fake.calls[1]["messages"] == [{"role": "user", "content": "What is new?"}]
 
